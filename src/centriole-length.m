@@ -105,11 +105,12 @@ function [thresh] = triangle_threshold (img)
 
   hist_thresh = (numel (counts) - thresh) ./ hist_range;
   thresh = thresh_offset + hist_thresh;
-
   thresh = im2double (cast (thresh, class (img)));
 endfunction
 
-function [mask, obj_cen] = get_initial_centroids (img)
+## Finds the initial coordinates for centriole centers by finding the
+## weighted centroids of the image peaks.
+function [obj_cen] = weighted_centroids (img)
   if (! isinteger (img))
     ## we could just use abs() but if data is floating point, we may
     ## be sure we are not messing up something.
@@ -128,6 +129,7 @@ function [mask, obj_cen] = get_initial_centroids (img)
 
   props = regionprops (bwconncomp (mask, conn), img, {"WeightedCentroid"});
   obj_cen = cell2mat ({props(:).WeightedCentroid}(:));
+  obj_cen(:,[1 2]) = obj_cen(:,[2 1]); # swap x,y to get row,column
 endfunction
 
 ## Create a structuring element ball shaped, for elements below the
@@ -166,15 +168,17 @@ endfunction
 ##
 ## but the cluster function is still not implemented.  So we fudge it
 ## with mathematical morphology.
-function [groups, n_labels] = cluster_points (points, sz, cutoff_distance)
+function [groups, n_labels] = cluster_points (points, sz, voxel_sizes,
+                                              cutoff_distance)
   canvas = false (sz);
-  points_linear = sub2ind (sz, round (points));
+  points_linear = sub2ind (sz, num2cell (round (points), 1){:});
   canvas(points_linear) = true;
   se = create_ball_se (voxel_sizes, cutoff_distance);
   canvas = imdilate (canvas, se);
   [labelled, n_labels] = bwlabeln (canvas);
   groups = labelled(points_linear);
-  groups = accumarray (groups, points, [n_labels 1], "@(x) {x}");
+  groups = accumarray (groups, num2cell (points, 2),
+                       [n_labels 1], @(x) {x});
 endfunction
 
 ##
@@ -203,16 +207,15 @@ function [status] = main (fpath, log_fpath)
 
   [img, voxel_sizes] = read_image (fpath);
   cutoff_voxels = round (cutoff_distance ./ voxel_sizes);
-
-  [~, initial_centroids] = get_initial_centroids (img);
-  ## swap x,y to get row,column
-  initial_centroids(:,[1 2]) = initial_centroids(:,[2 1]);
-  [centroid_groups, n_groups] = cluster_points (points, sz, cutoff_distance);
-
   sz = size (img);
-  nd = numel (sz);
+  nd = ndims (img);
+
+  initial_coords = weighted_centroids (img);
+  [coords_groups, n_groups] = cluster_points (initial_coords, sz, voxel_sizes,
+                                              cutoff_distance);
+
   for i = 1:n_groups
-    centroids = centroids_groups{i};
+    centroids = coords_groups{i};
     n_centroids = rows (centroids);
     if (n_centroids < 2)
       ## nothing yet
@@ -226,6 +229,10 @@ function [status] = main (fpath, log_fpath)
         idx{dim} = init(dim):ends(dim);
       endfor
       snippet = img(idx{:});
+      name = sprintf ("%s%i.tif", fpath, i);
+      snippet = reshape (snippet, rows (snippet), columns (snippet), 1,
+                         size (snippet, 3));
+      imwrite (snippet, name);
     else # > 2
       ## nothing yet
     endif
@@ -247,4 +254,4 @@ function [status] = main (fpath, log_fpath)
   status = 0;
 endfunction
 
-## main (argv (){:});
+main (argv (){:});
