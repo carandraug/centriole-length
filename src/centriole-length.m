@@ -16,6 +16,7 @@
 ## along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 pkg load image;
+pkg load optim;
 pkg load statistics;
 
 pkg load bioformats;
@@ -181,6 +182,169 @@ function [groups, n_labels] = cluster_points (points, sz, voxel_sizes,
                        [n_labels 1], @(x) {x});
 endfunction
 
+## Generate coordinates for pixels in physical space.
+##
+## LENGTHS is a vector of integers specifying the length of each
+##   dimension in pixels.
+##
+## RESOLUTION is a vector specifying the length of each element on
+##   each dimension.
+##
+## Returns a matrix of size KxD where K is the number of voxels and D
+## is the number of dimensions.
+function [coords] = get_coordinates (lengths, resolution)
+  nd = numel (lengths);
+  n_voxels = prod (lengths);
+
+  strides = cell (nd, 1);
+  for di = 1:nd
+    strides{di} = linspace (0, resolution(di).*lengths(di), lengths(di));
+  endfor
+
+  coords = cell (1, nd);
+  [coords{:}] = ndgrid (strides{:});
+  coords = cell2mat (cellfun (@vec, coords, 'UniformOutput', false));
+endfunction
+
+## Create image with gaussian functions.
+##
+## LENGTHS is a vector of integers specifying the output size.
+##
+## SIGMAS is the sigma for each gaussian.  We assume the same value
+##   for all dimensions (a blob).
+##
+## CENTERS is KxN arrays where K is the number of gaussians and N is
+##   the number of dimensions (numel of LENGTHS).  Coordinates are
+##   from the top left corner and physical coordinates (not indices).
+##
+## HEIGHTS is a vector with the peak height of each gaussian.
+##
+## RESOLUTION is a vector specifying the length of each element on
+##   each dimension.
+function [gaussian] = draw_gaussians (lengths, centers, sigmas,
+                                      heights, resolution)
+  n_gaussians = rows (centers);
+  nd = numel (lengths);
+
+  init_dist = cell (nd, 1);
+  for di = 1:nd
+    init_dist{di} = linspace (0, resolution(di).*lengths(di), lengths(di));
+  endfor
+
+  dists = cell (n_gaussians, 1);
+  for gi = 1:n_gaussians
+    dist = 0;
+    for di = 1:nd
+      dist = dist .+ (vec (init_dist{di} - centers(gi,di), di) .^2);
+    endfor
+    dists{gi} = dist;
+  endfor
+
+  gaussian = zeros (lengths);
+  for gi = 1:n_gaussians
+    gaussian += heights(gi) .* exp (- (dists{gi} ./ (2.*(sigmas(gi).^2))));
+  endfor
+endfunction
+
+## Add multiple gaussians.
+##
+## PARAMS is an array with the gaussian values.  It should be a
+##   (2+ND)xN matrix, one column for each gaussian.  Each column has
+##   the paramaters for a gaussian in the order:
+##
+##       [HEIGHT; CENTERS; SIGMA]
+##
+##   It assumes the same sigma for all dimensions while CENTERS is a
+##   NDx1 array.
+##
+## X is a matrix of size KxND, where each row corresponds to the
+##   coordinates where to evaluate the function.  K is then the number
+##   of points to evaluate the function, and ND is the number of
+##   dimensions.
+##
+## N is the number of gaussians to use.  It also defines the expected
+##   numel of PARAMS.
+##
+## Background is assumed to be zero so add whatever to Y.
+
+function [y] = gaussians (params, x, n = 1)
+  nd = columns (x);
+
+  ## Each column are the parameters for one more gaussian.
+  if (any (size (params) != [2+nd n]))
+    error ("gaussians: wrong sizes");
+  endif
+
+  heights = params(1,:);
+  centers = params(2:end-1,:);
+  sigmas = params(end,:);
+
+  ## A single 3D gaussian is of the form:
+  ##
+  ##          (  (  (x-xo)^2 )   (  (y-yo)^2 )   (  (z-zo)^2 ))
+  ##    A*exp (- (-----------) + (-----------) + (-----------))
+  ##          (  (  2*sx^2   )   (  2*sy^2   )   (  2*sz^2   ))
+  ##
+  ## But because we use the same sigma for all dimensions, we can
+  ## instead have:
+  ##
+  ##          (  (  (x-xo)^2 + (y-yo)^2 + (z-zo)^2  ))
+  ##    A*exp (- (----------------------------------))
+  ##          (  (              2*s^2               ))
+  ##
+
+  y = zeros (rows (x), 1);
+  for i = 1:n
+    dists = x - (centers(:,i).');
+    y += heights(i) .* exp (- (sum (dists.^2, 2) ./ (2 .* sigmas(i).^ 2)));
+  endfor
+endfunction
+
+function [centres] = fit_to_gaussians (data, guess, voxel_sizes)
+
+  data = double (data);
+
+  ## Initial guesses.
+  peaks = data(sub2ind (size (data), num2cell (round (guess), 1){:}));
+  sigma_guess = 0.05;
+
+  ## To physical dimensions
+  guess -= 1;
+  guess .*= voxel_sizes;
+
+  x0 = [peaks(1)       peaks(2)
+        guess(1,:)(:)  guess(2,:)(:)
+        sigma_guess    sigma_guess];
+
+  lower_bounds = [x0(1,:)*0.9 # peak is off by 10%
+                  x0([2 3 4],:)-0.1 # coordinates off by 0.1µm
+                  x0(5,:)-0.1]; # sigma off by 0.1
+
+  upper_bounds = [x0(1,:)*1.1 # peak is off by 10%
+                  x0([2 3 4],:)+0.1 # coordinates off by 0.1µm
+                  x0(5,:)+0.1]; # sigma off by 0.1
+
+  avg_kernel = fspecial ("average", [5 5]);
+  background = min (convn (data, avg_kernel, "valid")(:));
+
+  ## Function to fit two 3d gaussians.
+  g2d = @(p, x) gaussians (reshape (p, [5 2]), x, 2) + background;
+
+  ## Not really x, one column per dimension, one row per voxel.
+  xdata = get_coordinates (size (data), voxel_sizes);
+  ydata = data(:);
+
+  [x, ~, r, flag] = lsqcurvefit (g2d, x0(:), xdata, ydata, lower_bounds(:),
+                                 upper_bounds(:));
+
+  disp (flag);
+  centres = reshape (x, [5 2])(2:4,:).';
+
+  ## Back to pixel coordinates.
+  centres ./= voxel_sizes;
+  centres += 1;
+endfunction
+
 ##
 ##
 ##
@@ -215,27 +379,34 @@ function [status] = main (fpath, log_fpath)
                                               cutoff_distance);
 
   for i = 1:n_groups
-    centroids = coords_groups{i};
+    centroids = cell2mat (coords_groups{i});
     n_centroids = rows (centroids);
     if (n_centroids < 2)
-      ## nothing yet
+      continue; # nothing yet
     elseif (n_centroids == 2)
       min_d = min (centroids, [], 1);
       max_d = max (centroids, [], 1);
-      init = min (round (min_d - cutoff_voxels), 0);
-      ends = max (round (max_d + cutoff_voxels), sz);
+      init = max (round (min_d - cutoff_voxels), 1);
+      ends = min (round (max_d + cutoff_voxels), sz);
       idx = cell (nd, 1);
       for dim = 1:nd
         idx{dim} = init(dim):ends(dim);
       endfor
       snippet = img(idx{:});
-      name = sprintf ("%s%i.tif", fpath, i);
-      snippet = reshape (snippet, rows (snippet), columns (snippet), 1,
-                         size (snippet, 3));
-      imwrite (snippet, name);
     else # > 2
-      ## nothing yet
+      continue; # nothing yet
     endif
+
+    guess = centroids - init + 1;
+    fit = fit_to_gaussians (snippet, guess, voxel_sizes);
+
+    name = sprintf ("%s%i.tif", fpath, i);
+    mark = max (snippet(:));
+    mark += double (mark) * 1.25;
+    snippet(sub2ind (size (snippet), num2cell (round (fit), 1){:})) = mark;
+    snippet = reshape (snippet, rows (snippet), columns (snippet), 1,
+                       size (snippet, 3));
+    imwrite (snippet, name);
   endfor
 
 
