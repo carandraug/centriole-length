@@ -300,7 +300,7 @@ function [y] = gaussians (params, x, n = 1)
   endfor
 endfunction
 
-function [centres] = fit_to_gaussians (data, guess, voxel_sizes)
+function [centres, fitted] = fit_to_gaussians (data, guess, voxel_sizes)
 
   data = double (data);
 
@@ -337,7 +337,7 @@ function [centres] = fit_to_gaussians (data, guess, voxel_sizes)
   [x, ~, r, flag] = lsqcurvefit (g2d, x0(:), xdata, ydata, lower_bounds(:),
                                  upper_bounds(:));
 
-  disp (flag);
+  fitted = reshape (uint16 (g2d (x, xdata)), size (data));
   centres = reshape (x, [5 2])(2:4,:).';
 
   ## Back to pixel coordinates.
@@ -358,10 +358,13 @@ function m = centroids_mask (centroids, dims)
   m(ind) = true;
 endfunction
 
+## Create an array for writing with varargin interleaved.
+##
+## Each array on varargin should be of size MxNxK.
 function imwrite_log (fpath, varargin)
-  mlog = cat (3, cellfun (@im2uint8, varargin, "UniformOutput", false){:});
+  mlog = cat (3, cellfun (@im2uint16, varargin, "UniformOutput", false){:});
   mlog_size = size (mlog);
-  mlog = reshape (mlog, [mlog_size(1:2) 1 prod(mlog_size(3:4))]);
+  mlog = reshape (mlog, [mlog_size(1:2) 1 mlog_size(3)]);
   imwrite (mlog, fpath);
 endfunction
 
@@ -398,15 +401,16 @@ function [status] = main (fpath, log_fpath)
     endif
 
     guess = centroids - init + 1;
-    fit = fit_to_gaussians (snippet, guess, voxel_sizes);
+    [centres, fit] = fit_to_gaussians (snippet, guess, voxel_sizes);
 
-    name = sprintf ("%s%i.tif", fpath, i);
-    mark = max (snippet(:));
-    mark += double (mark) * 1.25;
-    snippet(sub2ind (size (snippet), num2cell (round (fit), 1){:})) = mark;
-    snippet = reshape (snippet, rows (snippet), columns (snippet), 1,
-                       size (snippet, 3));
-    imwrite (snippet, name);
+    fname = sprintf ("%s%i.tif", fpath, i);
+    imwrite_log (fname, snippet, fit);
+    ## mark = max (snippet(:));
+    ## mark += double (mark) * 1.25;
+    ## snippet(sub2ind (size (snippet), num2cell (round (centres), 1){:})) = mark;
+    ## snippet = reshape (snippet, rows (snippet), columns (snippet), 1,
+    ##                    size (snippet, 3));
+    ## imwrite (snippet, name);
   endfor
 
 
