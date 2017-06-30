@@ -25,7 +25,6 @@ javaMethod ("enableLogging", "loci.common.DebugTools", "ERROR");
 page_output_immediately (1);
 more ("off");
 
-
 function [img, voxel_sizes] = read_image (fpath)
   reader = bfGetReader (fpath);
   n_planes = reader.getImageCount ();
@@ -203,48 +202,9 @@ function [coords] = get_coordinates (lengths, resolution)
 
   coords = cell (1, nd);
   [coords{:}] = ndgrid (strides{:});
-  coords = cell2mat (cellfun (@vec, coords, 'UniformOutput', false));
+  coords = cell2mat (cellfun (@vec, coords, "UniformOutput", false));
 endfunction
 
-## Create image with gaussian functions.
-##
-## LENGTHS is a vector of integers specifying the output size.
-##
-## SIGMAS is the sigma for each gaussian.  We assume the same value
-##   for all dimensions (a blob).
-##
-## CENTERS is KxN arrays where K is the number of gaussians and N is
-##   the number of dimensions (numel of LENGTHS).  Coordinates are
-##   from the top left corner and physical coordinates (not indices).
-##
-## HEIGHTS is a vector with the peak height of each gaussian.
-##
-## RESOLUTION is a vector specifying the length of each element on
-##   each dimension.
-function [gaussian] = draw_gaussians (lengths, centers, sigmas,
-                                      heights, resolution)
-  n_gaussians = rows (centers);
-  nd = numel (lengths);
-
-  init_dist = cell (nd, 1);
-  for di = 1:nd
-    init_dist{di} = linspace (0, resolution(di).*lengths(di), lengths(di));
-  endfor
-
-  dists = cell (n_gaussians, 1);
-  for gi = 1:n_gaussians
-    dist = 0;
-    for di = 1:nd
-      dist = dist .+ (vec (init_dist{di} - centers(gi,di), di) .^2);
-    endfor
-    dists{gi} = dist;
-  endfor
-
-  gaussian = zeros (lengths);
-  for gi = 1:n_gaussians
-    gaussian += heights(gi) .* exp (- (dists{gi} ./ (2.*(sigmas(gi).^2))));
-  endfor
-endfunction
 
 ## Add multiple gaussians.
 ##
@@ -317,18 +277,28 @@ function [centres, fitted] = fit_to_gaussians (data, guess, voxel_sizes)
         sigma_guess    sigma_guess];
 
   lower_bounds = [x0(1,:)*0.9 # peak is off by 10%
-                  x0([2 3 4],:)-0.1 # coordinates off by 0.1µm
-                  x0(5,:)-0.1]; # sigma off by 0.1
+                  x0([2 3],:)-0.1 # coordinates off by 0.1µm
+                  x0(4,:)-0.1]; # sigma off by 0.1
 
   upper_bounds = [x0(1,:)*1.1 # peak is off by 10%
-                  x0([2 3 4],:)+0.1 # coordinates off by 0.1µm
-                  x0(5,:)+0.1]; # sigma off by 0.1
+                  x0([2 3],:)+0.1 # coordinates off by 0.1µm
+                  x0(4,:)+0.1]; # sigma off by 0.1
 
   avg_kernel = fspecial ("average", [5 5]);
   background = min (convn (data, avg_kernel, "valid")(:));
 
+  ## We are also fitting the background, so we need a vector since
+  ## it's an odd number of elements.
+  x0 = x0(:);
+  lower_bounds = lower_bounds(:);
+  upper_bounds = upper_bounds(:);
+
+  x0(end+1) = background;
+  lower_bounds(end+1) = background;
+  upper_bounds(end+1) = max (peaks(1), peaks(2));
+
   ## Function to fit two 3d gaussians.
-  g2d = @(p, x) gaussians (reshape (p, [5 2]), x, 2) + background;
+  g2d = @(p, x) gaussians (reshape (p(1:end-1), [4 2]), x, 2) + p(end);
 
   ## Not really x, one column per dimension, one row per voxel.
   xdata = get_coordinates (size (data), voxel_sizes);
@@ -338,39 +308,35 @@ function [centres, fitted] = fit_to_gaussians (data, guess, voxel_sizes)
                                  upper_bounds(:));
 
   fitted = reshape (uint16 (g2d (x, xdata)), size (data));
-  centres = reshape (x, [5 2])(2:4,:).';
+
+  ## DEBUG: will return sub-resolution fitted data.
+  ## xdata = get_coordinates (size (data) * log_increase,
+  ##                          voxel_sizes / log_increase);
+  ## fitted = reshape (uint16 (g2d (x, xdata)), size (data) * log_increase);
+
+  x(end) = []; # remove background
+  centres = reshape (x, [4 2])(2:3,:).';
 
   ## Back to pixel coordinates.
   centres ./= voxel_sizes;
   centres += 1;
 endfunction
 
-##
-##
-##
 
-# Note that centroids coordinates are [x, y, z]
-function m = centroids_mask (centroids, dims)
-  m   = false (dims);
-  cr  = round (centroids);
-  ## Centroids are [x y ...] and we need [row cols ...]
-  ind = sub2ind (dims, cr(:,2), cr(:,1), num2cell (cr(:,3:end), 1){:});
-  m(ind) = true;
-endfunction
-
-## Create an array for writing with varargin interleaved.
 ##
-## Each array on varargin should be of size MxNxK.
-function imwrite_log (fpath, varargin)
-  mlog = cat (3, cellfun (@im2uint16, varargin, "UniformOutput", false){:});
-  mlog_size = size (mlog);
-  mlog = reshape (mlog, [mlog_size(1:2) 1 mlog_size(3)]);
-  imwrite (mlog, fpath);
-endfunction
+##
+##
 
 function [status] = main (fpath, log_fpath)
   narginchk (1, 2);
   cutoff_distance = 0.5; # distance in microns
+
+  ## TODO: this should be an option, and the option value should be
+  ##       the path for the log image to be created.
+  write_log_image = true;
+  ## How many times is the log image larger to better see the position
+  ## of the centre in subpixel resolution.
+  log_increase = 5;
 
   [img, voxel_sizes] = read_image (fpath);
   cutoff_voxels = round (cutoff_distance ./ voxel_sizes);
@@ -380,6 +346,21 @@ function [status] = main (fpath, log_fpath)
   initial_coords = weighted_centroids (img);
   [coords_groups, n_groups] = cluster_points (initial_coords, sz, voxel_sizes,
                                               cutoff_distance);
+
+  if (write_log_image)
+    ## The log image will be 10x larger in xy dimensions to be easier
+    ## to see where the found centre is.  Because we are doing it in
+    ## 2D only, there's no need to expand Z as well.  We also have 3
+    ## channels, one for the real image, one for the generated image,
+    ## and one showing the centres.  The image Z is on the 4th
+    ## dimension.
+    log_canvas = zeros ([sz(1:2)*log_increase 3 sz(3)], class (img));
+
+    ## FIXME: seems like imresize is unable to handle ND images
+    for zi = 1:sz(3)
+      log_canvas(:,:,1,zi) = imresize (img(:,:,zi), log_increase, "nearest");
+    endfor
+  endif
 
   for i = 1:n_groups
     centroids = cell2mat (coords_groups{i});
@@ -401,30 +382,64 @@ function [status] = main (fpath, log_fpath)
     endif
 
     guess = centroids - init + 1;
-    [centres, fit] = fit_to_gaussians (snippet, guess, voxel_sizes);
 
-    fname = sprintf ("%s%i.tif", fpath, i);
-    imwrite_log (fname, snippet, fit);
-    ## mark = max (snippet(:));
-    ## mark += double (mark) * 1.25;
-    ## snippet(sub2ind (size (snippet), num2cell (round (centres), 1){:})) = mark;
-    ## snippet = reshape (snippet, rows (snippet), columns (snippet), 1,
-    ##                    size (snippet, 3));
-    ## imwrite (snippet, name);
+    ## Try fit to a 2d only.
+    guess(:,3) = [];
+    [~, max_slice] = max (sum (sum (snippet, 1), 2));
+    snippet_2d = snippet(:,:,max_slice);
+    voxel_sizes = voxel_sizes(1:2);
+
+    [centres, fit] = fit_to_gaussians (snippet_2d, guess, voxel_sizes);
+
+    if (write_log_image)
+      ## I guess we could do a bit better that this and actually use
+      ## the fitted function to increase this but then it would be a
+      ## bit of lying because we didn't actually use this grid when
+      ## fitting, right?
+      log_fit = imresize (fit, log_increase, "nearest");
+      log_idx_init = [(((idx{1}(1)-1)*log_increase) +1)
+                      (((idx{2}(1)-1)*log_increase) +1)];
+      log_idx_end = [idx{1}(end)*log_increase;
+                     idx{2}(end)*log_increase];
+      log_r_idx = log_idx_init(1):log_idx_end(1);
+      log_c_idx = log_idx_init(2):log_idx_end(end);
+
+      log_canvas(log_r_idx,log_c_idx,2,max_slice) = log_fit;
+
+      ## Draw a square on all planes showing the region of the
+      ## identified centriole pairs.
+      log_canvas(log_r_idx, [log_idx_init(2) log_idx_end(2)],3,:) = Inf;
+      log_canvas([log_idx_init(1) log_idx_end(1)], log_c_idx,3,:) = Inf;
+
+      ## Then draw a spot where the centre is.  This may seem off in
+      ## some cases and looking at the actual pixel values will show
+      ## that.  However, plotting the individual gaussians will show
+      ## that the reason why the highest intensity voxel is off by one
+      ## is due to the intensity from the other gaussian.
+      log_centres = (round (centres * log_increase - 0.5)
+                     + log_idx_init.' - log_increase);
+      log_canvas(log_centres(1,1), log_centres(1,2),3,max_slice) = Inf;
+      log_canvas(log_centres(2,1), log_centres(2,2),3,max_slice) = Inf;
+    endif
+
+    centres .*= voxel_sizes(1:2); # to physical dimensions
+    dist = sqrt (sumsq (centres(1,:) - centres(2,:)));
+    printf ("%f\n", dist);
   endfor
 
+  if (write_log_image)
+    ## We are at the end and going into the step that requires a lot
+    ## of memory.  Remove everything we no longer need to avoid making
+    ## use of swap or running out of memory.
+    clear -x log_canvas fpath
 
-  ## [mask, centroids] = get_centroids (img);
+    [fdir, fname, fext] = fileparts (fpath);
+    log_fpath = [fullfile(fdir, fname) "-log.tif"];
+    log_sz = size (log_canvas);
+    log_canvas = reshape (log_canvas, [log_sz(1:2) 1 prod(log_sz(3:4))]);
 
-  ## if (nargin > 1) # only create log image if requested
-  ##   imwrite_log (log_fpath, imadjust (img), mask,
-  ##                centroids_mask (centroids, size (img)));
-  ## endif
-
-  ## centroids(:,1:3) .*= voxel_sizes; # to physical dimensions
-
-  ## printf ("x, y, z, t\n");
-  ## printf ("%f,%f,%f, %i\n", centroids');
+    imwrite (log_canvas, log_fpath);
+  endif
 
   status = 0;
 endfunction
